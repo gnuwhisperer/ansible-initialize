@@ -1,0 +1,688 @@
+---
+
+###     README:
+###     This is a playbook to deploy Raspbian or Ubuntu on Raspberry Pi's for various uses
+###     I want to run headless, via ssh and avoid repeating tasks.
+###     This is a playbook that grew over time, so some style might be inconsistent.
+###     A lot was learned between starting this and the current state.
+###
+###     I restricted myself to use no community plugins in this file and have all information in a single yaml-file.
+###     This is a starting point for my roles. 
+###     Everything beyond that should have a sane directory structure.
+###     
+###     Some assumptions are to be respected.
+###     - We run this file from some machine that has ansible(current tested version 4.10) installed.
+###     - Runs with a user that has sudo rights.
+###     - The machine that runs this file has some kind of sdcard slot available.
+###   
+###     Most of the time, I run this from another Raspi, that I just use to do ansible stuff.
+###     
+###     !!! This will destroy data that is reachable under "/dev/{{ carddev }}". 
+###         The raspi config that I use lists the usb-cardreader under /dev/sdb.
+###
+###     Yes, stuff gets destroyed. We will write to /dev/ and there is no check for sane inputs.
+###     I already destroyed data involuntarly in the process. So please be careful. No Backups, no mercy.
+###
+###     Another thing would be physical disc space. 
+###     We need some at {{ tmppath }} to hold the distro images.
+###     This playbook has variables to download images from the interwebs and writes it to the sdcard.
+###     
+
+
+
+- hosts: initialize     #hostnames according to inventory.
+  serial: 1
+  become: true
+  gather_facts: false
+  environment:
+    host_key_checking: false
+  vars:
+    home_dir: /var/opt/ansible
+    ans_user: ansible
+    ans_uid: 420
+    network_gateway: 192.168.1.1
+    packages_req:
+      - acl
+      - aptitude
+      - lsb-release
+      - network-manager
+      - python3-apt
+      - python3-minimal
+      - vim-tiny
+
+  ## I have a routine to write images to sd-cards.
+  ## the cardreader is in the variables and should be check before running this script
+  ##  ↓idea to make the writing more flexible but setting vars locally needs some delegation
+  ##  tmppath: "{{ initvars.image_tempdir | default['/mnt/image-tmp'] }}"
+  ##  carddev: "{{ initvars.sdcardwriter | default['sdb'] }}"
+ 
+    tmppath: "/mnt/image-tmp"
+    carddev: "sdb"
+    distro:             ## This should be here, or somewhere else in the inventory
+      ubuntu:
+        name: ubuntu
+        url: "https://cdimage.ubuntu.com/releases/20.04.2/release/ubuntu-20.04.2-preinstalled-server-arm64+raspi.img.xz"
+        filename: "ubuntu-20.04.2-preinstalled-server-arm64+raspi.img"
+        username: testuser
+        userpw: testtest
+        ### 
+        ### There is still some work to do, to remove the ubuntu user autmatically.
+        ### Aaaand make this all a bit smoother while having more flexibility
+        #
+        #
+        ## username: ubuntu
+        ## userpw: ubuntu
+        ### personal flavour of packages that come with ubuntu and have no use in my workflow
+        packages_remove:
+          - bolt
+          - byobu
+          - chrony
+          - cloud-guest-utils
+          - cloud-init
+          - cloud-initramfs-copymods
+          - cloud-initramfs-dyn-netconf
+          - landscape-common
+          - nano
+          - pastebininit
+          - plymouth
+          - snapd
+          - software-properties-common
+          - sound-theme-freedesktop
+          - tmux
+          - unattended-upgrades
+      raspbian:
+        name: raspbian
+        url: "https://downloads.raspberrypi.org/raspios_lite_armhf/images/raspios_lite_armhf-2020-05-28/2020-05-27-raspios-buster-lite-armhf.zip"
+        filename: "2020-05-27-raspios-buster-lite-armhf.img"
+        username: pi
+        userpw: raspberry
+        packages_remove:
+          - chrony
+            
+            
+    ###  Set a Variable hostdist somewhere or it defaults to raspbian
+    dist: "{{ hostdist | d( distro.raspbian ) }}"
+
+
+###
+###     End of Variables
+###
+
+  
+  tasks:
+    - name: "Are you sure, you want to overwrite /dev/{{ carddev }} with random data?"
+      pause:
+        prompt: "hit Enter to continue"
+      tags: prompt, wipe
+      when: ( wipeit is defined ) and  ( wipeit|bool == True )
+  ## ansible-playbook -l quadropi4 -e wipeit=true -t wipe initialize-sdcard.yml
+
+    - name: "wiping sdcard at {{ carddev }}, because the variable is set"
+      local_action: 
+        module: ansible.builtin.command
+        cmd: "dd if=/dev/urandom of=/dev/{{ carddev }} bs=512 count=128"
+      when: ( wipeit is defined ) and  ( wipeit|bool == True )
+      tags: wipe
+
+    - name: "try to reach the device at {{ ansible_host }} with known keys"
+      ansible.builtin.ping:
+      tags: connect
+      ignore_unreachable: true
+      ignore_errors: True
+      register: firstping
+    
+    - name: "change connection user"
+      set_fact:
+        ansible_user: "{{ dist.username }}"
+        ansible_ssh_pass: "{{ dist.userpw }}"
+      when: firstping is unreachable
+
+    - name: "try to reach the device at {{ ansible_host }} with {{ dist.username }} credentials for {{ dist.name }}"
+      ansible.builtin.ping:
+      tags: connect
+      ignore_unreachable: true
+      ignore_errors: True
+      register: secondping
+      when: firstping is unreachable
+
+    - name: "write sd-card if device is not found"
+      ## when parameter at the end of the block
+      block:
+        - name: "Put the sdcard in the reader, all data on /dev/{{ carddev }} will be wiped"
+          pause:
+            prompt: "plugin empty sd-card"
+          tags: prompt
+          when: ( wipeit is not defined )
+
+        - name: "probe to mount boot and data dir"
+          local_action: 
+            module: ansible.posix.mount
+            src: "/dev/{{ carddev }}{{ item }}"
+            path: "{{ tmppath }}/{{ carddev }}{{ item }}"
+            fstype: auto
+            state: mounted
+            fstab: /tmp/tmp.fstab
+          register: iso_mount
+          ignore_errors: true
+          with_items: 
+            - 1
+            - 2
+
+#       - debug: msg={{ dist }}
+
+        - name: "download and unpack raspbian-image"
+          local_action: 
+            module: ansible.builtin.unarchive 
+            src: "{{ dist.url }}"
+            dest: "{{ tmppath }}"
+            remote_src: yes 
+            creates: "{{ tmppath }}/{{ dist.filename }}"
+          tags: 
+            - download
+#           - unpack
+          register: download_iso
+          when: (iso_mount is failed) and (dist.name is match("raspbian") )
+
+        - name: "download and unpack libreelec-image"
+          become: true
+          block:
+            - name: "downloading from {{ dist.url }}"
+              local_action: 
+                module: ansible.builtin.get_url 
+                url: "{{ dist.url }}"
+                dest: "{{ tmppath }}/{{ dist.filename }}.gz"
+                tmp_dest: "{{ tmppath }}"
+              register: download_iso
+            - name: "unpack to {{ tmppath }}/{{ dist.filename }}"
+              local_action: 
+                module: ansible.builtin.command
+                cmd: "/bin/gunzip -k {{ tmppath }}/{{ dist.filename }}.gz"
+                creates: "{{ tmppath }}/{{ dist.filename }}"
+              register: download_iso
+              when: download_iso is changed
+          tags:
+            - download
+#           - unpack
+          when: (iso_mount is failed) and (dist.name is match("libreelec") )
+
+        - name: "download and unpack ubuntu-image"
+          become: true
+          block:
+            - name: "downloading from {{ dist.url }}"
+              local_action: 
+                module: ansible.builtin.get_url 
+                url: "{{ dist.url }}"
+                dest: "{{ tmppath }}/{{ dist.filename }}.xz"
+                tmp_dest: "{{ tmppath }}"
+              register: download_iso
+            - name: "unpack to {{ tmppath }}/{{ dist.filename }}"
+              local_action: 
+                module: ansible.builtin.command
+                cmd: "/usr/bin/unxz -k {{ tmppath }}/{{ dist.filename }}.xz"
+                creates: "{{ tmppath }}/{{ dist.filename }}"
+              register: download_iso
+              when: download_iso is changed
+          tags:
+            - download
+            - unpack
+          when: (iso_mount is failed) and (dist.name is match("ubuntu") )
+
+        ### Turned out to be the fastest way to write a image
+        ### cat ubuntu.iso >/dev/usb 
+        ### 
+    
+        - name: "write image to sdcard"
+          local_action:
+            module:   ansible.builtin.shell
+            cmd: "cat {{ dist.filename }} >/dev/{{ carddev }}"
+            chdir: "{{ tmppath }}"
+          when: (download_iso is changed) or (iso_mount is failed)
+###            
+###
+###         Maybe not yet needed:
+##
+###        - name: "extend second filesystem"
+###          local_action:
+###            module: community.general.filesystem
+###            fstype: ext4
+###            dev: "/dev/{{ carddev }}"
+###            resizefs: yes
+        
+        - name: "mount boot and data dir"
+          local_action: 
+            module: ansible.posix.mount
+            src: "/dev/{{ carddev }}{{ item }}"
+            path: "{{ tmppath }}/{{ carddev }}{{ item }}"
+            fstype: auto
+            state: mounted
+            fstab: /tmp/tmp.fstab
+          register: iso_mount
+          with_items: 
+            - 1
+            - 2
+
+        - name: "change hostname"
+          local_action: 
+            module: ansible.builtin.lineinfile
+            dest: "{{ tmppath }}/{{ carddev }}2/etc/hostname"
+            line: "{{ inventory_hostname }}"
+            insertbefore: BOF
+            state: present
+          when: (iso_mount is not failed) and (dist.name is not match("libreelec") )
+
+
+
+###         The whole libreelec idea is on hold.
+###         So far, I could not make out a way to configure anything before boot.
+###
+###         
+###        - name: "download and unpack libreelec-backup with settings"
+###          become: true
+###          local_action:
+###            module : ansible.builtin.unarchive
+###            src: "./files/storage.zip"
+###            dest: "{{ tmppath }}/{{ carddev }}2/"
+###            remote_src: yes
+###            creates: "{{ tmppath }}/{{ carddev }}2/.config"
+###          tags: 
+###            - download
+###            - unpack
+###            - libreelec
+###          register: kodiarchive
+###          when: (iso_mount is not failed) and (dist.name is match("libreelec") )
+
+        - name: "add my default lines to /etc/hosts"
+          local_action: 
+            module: ansible.builtin.lineinfile
+            dest: "{{ tmppath }}/{{ carddev }}2/etc/hosts"
+            line: "{{ item.ipv4 }}      {{ item.name }}"
+            search_string: "{{ item.name }}"
+            insertbefore: EOF 
+            state: present
+          with_items: "{{ etchosts }}"
+          when: ((iso_mount is not failed) and ( etchosts is defined )) and (dist.name is not match("libreelec") )
+
+        - name: "enable ssh"
+          local_action: 
+            module: ansible.builtin.file
+            path: "{{ tmppath }}/{{ carddev }}1/ssh"
+            state: touch
+            modification_time: preserve
+            access_time: preserve
+          when: (iso_mount is not failed) and (dist.name is match("raspbian") )
+
+        - name: "add static ip for raspbian base"
+          local_action: 
+            module: ansible.builtin.blockinfile
+            create: yes
+            path: "{{ tmppath }}/{{ carddev }}2/etc/dhcpcd.conf"
+            marker: "### staticip {mark}"
+            insertbefore: EOF
+            block: |
+              interface eth0
+              static ip_address={{ ansible_host }}/24
+              static routers={{ network_gateway }}
+          when: dist.name is match("raspbian")
+            
+        - name: "add static ip for ubuntu base"
+          local_action: 
+            module: ansible.builtin.blockinfile
+            create: yes
+            path: "{{ tmppath }}/{{ carddev }}2/etc/netplan/23-ansible-init.yaml"
+            marker: "### staticip {mark}"
+            insertbefore: EOF
+            block: |
+              network:
+                  ethernets:
+                      eth0:
+                          addresses:
+                              - {{ ansible_host }}/24
+                          gateway4: {{ network_gateway }}
+                  version: 2
+          when: (iso_mount is not failed) and (dist.name is match("ubuntu") )
+            
+##        - name: "change pwd-expiry via cloud-init because of buntu | it did cost me a weekend to figure out"
+##          local_action: 
+##            module: ansible.builtin.lineinfile
+##            dest: "{{ tmppath }}/{{ carddev }}2/etc/cloud/cloud.cfg"
+##            regexp: '^chpasswd'
+##            line: 'chpasswd: { expire: False }'
+##            insertafter: 'disable_root:'
+##            state: present
+##          when: (iso_mount is not failed) and (dist.name is match("ubuntu") )
+##
+##        - name: "change pwd-expiredate via cloud-init because of buntu | it did cost me a weekend to figure out"
+##          local_action: 
+##            module: ansible.builtin.lineinfile
+##            dest: "{{ tmppath }}/{{ carddev }}2/etc/cloud/cloud.cfg"
+##            regexp: '^    expiredate:'
+##            line: "     expiredate: '2032-09-01'"
+##            insertafter: 'default_user:'
+##            state: present
+##          when: (iso_mount is not failed) and (dist.name is match("ubuntu") )
+##
+##      The following lines create a user that is allowed to connect via ssh to achieve
+##      a more automated deployment process.
+##      raspbian and ubuntu follow differen paths to enable a secure ssh login somehow.
+##      Writing it bare to the filesystem is kind of a unix way, and might work on more than one distro.
+##      So, I'll keep it for later.
+##
+##
+        - name: "manually edit /etc/passwd"
+          local_action: 
+            module: ansible.builtin.lineinfile
+            dest: "{{ tmppath }}/{{ carddev }}2/etc/passwd"
+            line: "{{ dist.username }}:x:1002:1003:,,,:/home/{{ dist.username }}:/bin/bash"
+            regexp: "^{{ dist.username }}"
+            insertbefore: 'EOF'
+            state: present
+          when: (iso_mount is not failed) and (dist.name is match("ubuntu") )
+
+        - name: "manually edit /etc/shadow"
+          local_action: 
+            module: ansible.builtin.lineinfile
+            dest: "{{ tmppath }}/{{ carddev }}2/etc/shadow"
+            line: "{{ dist.username }}:$6$bytAX03Ltb1QmBrb$WZuNRPe5iFZoVB4zMQ01EwQIjnYw3BGBq2NvEOcnQyZvEAF.xpGXuyWj4h6bYxScZjV8rcEz1SZVuF4RQ5.jz1:18811:0:99999:7:::"
+            regexp: "^{{ dist.username }}"
+            insertbefore: 'EOF'
+            state: present
+          when: (iso_mount is not failed) and (dist.name is match("ubuntu") )
+
+        - name: "manually edit /etc/sudoers.d/testsudo"
+          local_action: 
+            module: lineinfile
+            dest: "/{{ tmppath }}/{{ carddev }}2/etc/sudoers.d/{{ dist.username }}"
+            state: present
+            create: yes
+            regexp: "^{{ dist.username }} ALL="
+            line: "{{ dist.username }} ALL=(ALL) NOPASSWD: ALL"
+          when: (iso_mount is not failed) and (dist.name is match("ubuntu") )
+
+        - name: "Create home  directory for {{ dist.username }}"
+          become: true
+          local_action: 
+            module: ansible.builtin.file
+            state: directory
+            recurse: yes
+            path: "/{{ tmppath }}/{{ carddev }}2/home/{{ dist.username }}"
+            owner: "root"
+            mode: u=rwx,g=rwx,o=rwx
+          when: (iso_mount is not failed) and (dist.name is match("ubuntu") )
+
+        - name: "umount boot and data dir"
+          local_action: 
+            module: ansible.posix.mount
+            src: "/dev/{{ carddev }}{{ item }}"
+            path: "{{ tmppath }}/{{ carddev }}{{ item }}"
+            fstype: auto
+            state: unmounted
+            fstab: /tmp/tmp.fstab
+          tags: umount
+          register: iso_mount
+          ignore_errors: true
+          with_items: 
+            - 1
+            - 2
+
+        - name: "delete temporary fstab"
+          local_action: 
+            module: ansible.builtin.file
+            path: /tmp/tmp.fstab
+            state: absent
+          tags: umount
+
+        - name: "End the play for Libreelec"
+          meta: end_host
+          when: dist.name is match("libreelec")
+
+        - name: "A helpful reminder to unplugg the sdcard"
+          pause:
+            prompt: "Unplug sd-card, power {{ inventory_hostname }} on and press Enter."
+        - name: "change connection user"
+          set_fact:
+            ansible_user: "{{ dist.username }}"
+            ansible_ssh_pass: "{{ dist.userpw }}"
+          tags: connect
+            
+
+        - name: "trying to reach {{ inventory_hostname }} on {{ ansible_host }} (can take up to 10minutes)"
+          ### longer delay so firstboot has some time for magic
+          ### maybe a ping with some wait stuff works better
+          wait_for_connection:
+            delay: 120
+            timeout: 12000
+            sleep: 10
+            connect_timeout: 5
+          register: firstboot
+          tags: connect
+
+        - name: "time measurement"
+          debug: msg={{ firstboot.elapsed}}
+          tags: connect
+      when: (firstping or secondping) is unreachable
+
+
+    - name: "Create user {{ ans_user }} and generate Keys"
+      user:
+        name: "{{ ans_user }}"
+        uid: "{{ ans_uid }}"
+  #     comment: "created by ansible"
+        state: present
+        move_home: yes
+        #      system: yes
+        home: "{{ home_dir }}"
+        generate_ssh_key: yes
+        ssh_key_type: ed25519
+        ssh_key_file: .ssh/id_ed25519
+    #      ANSIBLE_SSH_PIPELINING: False
+    #     pipelining: False
+  
+    - name: "prepare {{ ans_user }} for sudo without pw"
+      become: true
+      lineinfile:
+       dest: "/etc/sudoers.d/{{ ans_user }}"
+       state: present
+       create: yes
+       regexp: "^{{ ans_user }} ALL="
+       line: "{{ ans_user }} ALL=(ALL) NOPASSWD: ALL"
+       validate: '/usr/sbin/visudo -cf %s'
+  
+    - name: "disable requiretty"
+      become: true
+      lineinfile:
+       dest: /etc/sudoers.d/{{ ans_user }}
+       state: present
+       create: yes
+       regexp: '^Defaults'
+       line: "Defaults:{{ ans_user }} !requiretty"
+       validate: '/usr/sbin/visudo -cf %s'
+  
+    - name: add authorized_keys file
+      become: true
+      lineinfile:
+       dest: "{{ home_dir }}/.ssh/authorized_keys"
+       state: present
+       create: yes
+       regexp: ".* {{ ans_user }} key$"
+       mode: 0600
+       owner: "{{ ans_user }}"
+       group: "{{ ans_user }}"
+       line: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF7s5+du9saM3qvinLRpnIO4rXuOtUo5kOHz3ENxxo/h ansible key'
+       validate: '/usr/bin/ssh-keygen -lf %s'
+  
+    - name: "configure apt-cache proxy"
+      ### this might break if the apt-cacher system is unreachable
+      become: true
+      ansible.builtin.lineinfile:
+        path: /etc/apt/apt.conf.d/proxy
+        search_string: 'Acquire'
+        line: 'Acquire::http { Proxy "http://{{ apt_cacher }}:3142"; }'
+        create: yes
+      when: ( apt_cacher is defined )
+      tags: cache
+
+    - name: "remove upgrade packages"
+      become: true
+      ansible.builtin.apt:
+        name: unattended-upgrades 
+        autoremove: yes
+        purge: yes
+      when: (dist.name is match("ubuntu") )
+
+    - name: "disable unneeded services"
+      ### because we don't need daily updates on testbenches
+      become: true
+      systemd:
+        state: stopped
+        masked: True
+        daemon_reload: yes
+        enabled: no
+        name: "{{ item }}"
+      with_items:
+        - apt-daily.service  
+        - apt-daily-upgrade.timer
+        - apt-daily.timer
+        - apt-daily-upgrade.service
+      tags: systemd 
+  
+    - name: "add {{ packages_req }} and remove {{ dist.packages_remove }}"
+      become: true
+      ansible.builtin.apt:
+        name: "{{ item.name }}" 
+        state: "{{ item.state }}"
+       # upgrade: safe
+        update_cache: yes
+        autoremove: yes
+        purge: yes
+        cache_valid_time: 86400 #One day
+      with_items:
+        - name: "{{ packages_req }}"
+          state: present
+        - name: "{{ dist.packages_remove }}"
+          state: absent
+      tags: install
+      notify:
+      - restart system
+  
+    - name: "Set Timezone"
+      become: true
+      timezone:
+        name: Europe/Berlin
+  
+    - name: "check if systemd is used"
+      stat:
+        path: /bin/systemd
+      register: systemdisused
+
+    - name: Set ntp-Servers and reload
+      lineinfile:
+        dest: /etc/systemd/timesyncd.conf
+        state: present
+        regexp: '^NTP'
+        insertafter: '^\[Time\]'
+        line: 'NTP=ptbtime1.ptb.de ptbtime2.ptb.de ptbtime3.ptb.de'
+      notify: restart system
+
+    - name: "change connection to {{ ans_user }}"
+      ### when the first attempt to use the ping module fails
+      ### the reconnection logic is using the public known default credentials
+      ### I want to remove the default user so that there is less to forget later
+      set_fact:
+        ansible_user: "{{ ans_user }}"
+      when: firstping is unreachable
+
+    - name: "mandatory reboot after user change"
+      reboot:
+        msg: "reboot by ansible"
+        post_reboot_delay: 20
+        connect_timeout: 30
+        reboot_timeout: 600
+      tags: reboot
+      when: firstping is unreachable
+
+    - name: "upgrade dist"
+      become: true
+      ansible.builtin.apt:
+        upgrade: dist
+        autoclean: yes
+        autoremove: yes
+        update_cache: yes
+        cache_valid_time: 86400 #One day
+      tags: install
+      register: distupgrade
+      notify:
+      - restart system
+  
+    - name: "mandatory reboot after dist upgrade"
+      reboot:
+        msg: "reboot by ansible"
+        post_reboot_delay: 20
+        reboot_timeout: 600
+      tags: reboot
+      when: distupgrade is changed
+    
+    - name: "remove insecure default ubuntu user"
+      become: true
+      ansible.builtin.user:
+          name: ubuntu
+          state: absent
+      when: (dist.name is match("ubuntu") )
+    
+    - name: "remove insecure default {{ dist.username }} user"
+      become: true
+      ansible.builtin.user:
+          name: "{{ dist.username }}"
+          state: absent
+#####  was the user really removed?
+  
+    - name: "setting hostname after inventory hostname"
+      become: true
+      ansible.builtin.hostname:
+          name: "{{ inventory_hostname }}"
+      notify:
+      - restart system
+  
+    - name: "edit /etc/hosts/"
+      lineinfile:
+        dest: /etc/hosts
+        state: present
+        search_string: '^127.0.0.1'
+        line: "127.0.1.1               {{ inventory_hostname }}"
+      notify: restart system
+
+    - name: "disable swap service"
+      become: true
+      systemd:
+        state: stopped
+        daemon_reload: yes
+        enabled: no
+        name: dphys-swapfile.service
+      tags: systemd
+      when: dist.name is match("raspbian")
+  
+    - name: "Create directory for ansible custom facts"
+      become: true
+      ansible.builtin.file:
+        state: directory
+        recurse: yes
+        path: /etc/ansible/facts.d
+  #      owner: "{{ ans_user }}"
+        mode: u=rwx,g=rx,o=rx
+  
+    - name: "add country code to wpa_supplicant"
+      become: true
+      ansible.builtin.lineinfile:
+        path: /etc/wpa_supplicant/wpa_supplicant.conf
+        state: present
+        create: yes
+        regexp: '^country='
+        insertafter: BOF
+        line: "country=DE"
+      tags: wifi
+
+  handlers:
+
+  - name: restart system
+    reboot:
+      reboot_timeout: 120
+      msg: "I am going to reboot now"
