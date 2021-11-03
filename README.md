@@ -25,3 +25,4 @@ Another thing would be physical disc space.
 We need some at {{ tmppath }} to hold the distro images.
 This playbook has variables to download images from the interwebs and writes it to the sdcard.
 
+I collected various Raspis over the last years(Raspi v1 to v4). Not sure right now, what versions I have "tested", I just take random Raspis from a box and start deploying and debugging as I move along. So far no Raspi-Specific issues occoured.
